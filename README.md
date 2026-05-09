@@ -1,5 +1,7 @@
 # Zetter Chat Harness Design
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/anitigravitylab-oss/zetter-chat-harness-design)
+
 このリポジトリには、Zetter chat harness の**機密情報を除いた設計文書**を収録しています。
 
 This repository contains **sanitized architecture and design documents** for the Zetter chat harness.

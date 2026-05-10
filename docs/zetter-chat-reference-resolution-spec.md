@@ -64,6 +64,41 @@ Zetter chat を、**「それっぽく答えるチャット」から「参照先
 
 ---
 
+## 2026-05 update: prompt-first reference contracts
+
+この文書の初版は RRL をやや **code-first** に寄せて説明していたが、現行方針はより正確には **prompt-first / contract-validated / deterministic-binding** である。
+
+現在の参照解決は次の役割分担を採る。
+
+1. **prompt が意味を決める**
+   - user / time / scope / relation / latest semantics を `IntentSpec` / `ReferenceSpec` 相当の JSON で決める
+2. **code が contract を検証する**
+   - enum drift
+   - pseudo-user placeholder 混入
+   - explicit date の未反映
+   - latest scope の崩れ
+   をチェックする
+3. **壊れた参照は repair stage に戻す**
+   - contract 違反の JSON をそのまま tool 実行へ進めず、bounded retry で reference repair を行う
+4. **deterministic 層は semantic rewrite をしない**
+   - `viewer-self -> viewer.userId`
+   - resolved userId / date range の binding
+   - safe clarification / limitation
+   のみを担当し、意味の勝手な再解釈は行わない
+
+特に現在は、次の contract を強制対象として扱う。
+
+1. first-person request は `viewer-self` に落とす
+2. `semantic.users` / `ReferenceSpec` に `me`, `self`, `viewer`, `私`, `自分` などを残さない
+3. bare `最新N件` は `post-query + outputMode=latest + sortOrder=newest + latestScope=global`
+4. user-scoped latest は `latestScope=user`
+5. include latest (`Xも含めて最新N件`) は `latestScope=global-with-includes`
+6. bare latest で勝手に `toDate=current-date` のような implicit range を足さない
+
+以降の章は RRL の全体像として引き続き有効だが、**「コードで意味を解く層」というより、「prompt が出した参照を code が検証・repair・binding する層」**として読むのが現行状態に近い。
+
+---
+
 ## 結論
 
 導入すべきなのは、`resolve_user` 単体ではなく、**Reference Resolution Layer (RRL)** である。
@@ -108,9 +143,9 @@ Zetter chat の質問処理を、以下の 6 段に整理する。
 - `昨日の流れを教えて`
 - `そらの別垢ある？`
 
-### 3. コードで解けるものはコードで解く
+### 3. contract を先に固め、binding はコードで行う
 
-RRL はまず **code-first** で動く。
+RRL はまず **prompt-first / contract-first** で動く。
 
 - `@` / `＠` の正規化
 - `さん` / `氏` / `ちゃん` の除去
@@ -118,12 +153,14 @@ RRL はまず **code-first** で動く。
 - `この投稿` の近傍参照
 - `Zetter全体` / `この人` / `自分` の scope 解釈
 
-これで解けない曖昧さだけ、確認質問や LLM 補助へ回す。
+ただし、これらは意味決定そのものではなく、**prompt が決めた参照仕様の binding / validation / repair 補助**として使う。  
+contract に合わない場合は、そのまま実行せず confirmation / repair に戻す。
 
-### 4. LLM は「解決後の言語化」と「曖昧時の補助」に使う
+### 4. LLM は「参照決定」と「解決後の言語化」に分けて使う
 
 LLM の役割は残るが、役割は狭める。
 
+- `viewer-self`, `latestScope`, time scope などの semantic decision
 - 解決済みデータの自然な説明
 - 軽い要約
 - 複数候補があるときの確認質問文

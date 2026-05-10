@@ -25,6 +25,37 @@ Zetter の AI チャットを、**「なんとなくうまく動く」状態か�
 
 ---
 
+## 2026-05 update: contract / multi-turn regression を strict suite に含める
+
+現行ハーネスでは、deterministic assertion だけでなく **reasoning artifact contract** 自体も回帰対象に含める必要がある。
+
+特に strict suite へ入れるべきものは次の通り。
+
+1. **viewer-self contract**
+   - `私の4/25の投稿`
+   - `自分の最新5件`
+   で pseudo-user search に落ちず、`viewer-self` と flat ISO date が残ること
+2. **latest scope contract**
+   - bare `最新5件` は `latestScope=global`
+   - `ymdの最新5件` は `latestScope=user`
+   - `ゼタちゃんも含めて最新5件` は `latestScope=global-with-includes`
+   - bare latest に implicit date range を足さないこと
+3. **multi-turn carry-forward**
+   - `ymdの4/25の投稿をみして` → `その前後も見せて`
+   のような follow-up で user/time が落ちないこと
+4. **wrong-user / wrong-date / wrong-scope fail-fast**
+   - verifier または contract validator が dropped user/date/scope を fail と判定すること
+
+したがって eval は、最終文面だけでなく次の artifact も見られる形が望ましい。
+
+- `IntentSpec`
+- `ReferenceSpec`
+- `ResearchPlan`
+- `VerificationReport`
+- phase / failure category
+
+---
+
 ## 背景
 
 現行ハーネスは、Gate / Router / Tool Augmentation / Judge / Finalizer の分離があり、構造自体はよくできている。一方で、運用品質の面では次の弱点が残っている。
@@ -210,6 +241,14 @@ deterministic 化後も、LLM の役割は残る。
 9. `hallucination_cases.json`
    - 実在しない投稿、曖昧な日付、存在しない数値
    - groundedness を確認
+10. `reference_resolution.json`
+   - self reference / deictic reference / unresolved reference
+   - wrong-user clarification と contract repair を確認
+11. `post_dataset_queries.json`
+   - user/date scoped list / count / first-last
+   - dropped date / dropped user を確認
+12. `phase_failure_contracts.json`
+   - verifier fail, terminal explainer, repair phase の契約を確認
 
 ---
 
@@ -234,7 +273,11 @@ deterministic 化後も、LLM の役割は残る。
     "時刻が JST 表記である",
     "最新投稿の時刻を現在時刻扱いしていない"
   ],
-  "strict": true
+  "strict": true,
+  "expected_artifact_checks": [
+    "reference.latestScope == global",
+    "reference.time.mode == none"
+  ]
 }
 ```
 

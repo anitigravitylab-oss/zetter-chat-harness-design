@@ -23,6 +23,56 @@
 
 ---
 
+## 2026-05 update: reasoning-barrier 中心の現行方針
+
+この文書の初版は **flash-only coordinator pipeline** を中心に書かれているが、現行の Zetter chat はそこからさらに進み、**direction-setting を multi-stage reasoning barrier に寄せる構成**へ移っている。
+
+現在の要点は次の通り。
+
+1. **実行前に reasoning barrier を通す**
+   - `Context Snapshot`
+   - `IntentSpec`
+   - `ReferenceSpec`
+   - `ResearchPlan`
+   - `FeasibilityDecision`
+   を先に作り、tool 実行や DB 参照はその後にだけ行う
+2. **意味決定は prompt 側、binding は deterministic 側**
+   - prompt は request の意味、対象 user/time/scope、必要 evidence を JSON で決める
+   - code は schema / enum / placeholder / date flattening / latest semantics を検証し、`viewer-self -> viewer.userId` のような binding だけを行う
+3. **contract に合わない中間 JSON は repair する**
+   - 参照や task の contract が壊れていたら、そのまま実行せず bounded retry で `reference repair` に差し戻す
+   - repair 後も直らなければ、silent reinterpretation ではなく clarification / limitation に倒す
+4. **rendering も 1 本化しない**
+   - factual post query のようなケースは deterministic renderer を優先する
+   - compare / synthesis のような複雑ケースだけ、軽量 final rendering を許可する
+5. **verifier fail は前段へ戻す**
+   - `answer-overclaim` のような文面問題だけでなく
+   - `intent-mismatch` / `reference-mismatch` / `insufficient-evidence` では reasoning phase に戻して組み直す
+
+現行 artifact は少なくとも次を前提にする。
+
+- `IntentSpec`
+- `ReferenceSpec`
+- `ResearchPlan`
+- `FeasibilityDecision`
+- `EvidencePack`
+- `AnswerSpec`
+- `VerificationReport`
+- `RepairSpec`
+
+また、最近の prompt contract では次を強く固定している。
+
+1. first-person (`私`, `自分`, `僕`, `俺`) は `viewer-self`
+2. `semantic.users` や `referenceSpec` に `me`, `self`, `viewer`, `私` などの pseudo-user を残さない
+3. bare `最新N件` は `post-query + outputMode=latest + sortOrder=newest + latestScope=global`
+4. `私の最新N件` / `ymdの最新N件` は `latestScope=user`
+5. `ゼタちゃんも含めて最新N件` は `latestScope=global-with-includes`
+6. bare latest request に implicit date range を捏造しない
+
+以下の本文には初期 coordinator 案の記述も残るが、**現行の読み方としては「router だけで進める」のではなく、「reasoning barrier で task/reference/plan を確定してから executor に渡す」**ものとして読む。
+
+---
+
 ## 背景
 
 現行の `deepseek-chat.ts` は、tool safety と継続性を高める修正を積み上げており、破綻しにくさは上がっている。一方で、次の点が token 消費と実行品質の両面でボトルネックになっている。

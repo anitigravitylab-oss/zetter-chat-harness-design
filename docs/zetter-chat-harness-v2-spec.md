@@ -23,6 +23,56 @@
 
 ---
 
+## 2026-05 update: reasoning-barrier 中心の現行方針
+
+この文書の初版は **flash-only coordinator pipeline** を中心に書かれているが、現行の Zetter chat はそこからさらに進み、**direction-setting を multi-stage reasoning barrier に寄せる構成**へ移っている。
+
+現在の要点は次の通り。
+
+1. **実行前に reasoning barrier を通す**
+   - `Context Snapshot`
+   - `IntentSpec`
+   - `ReferenceSpec`
+   - `ResearchPlan`
+   - `FeasibilityDecision`
+   を先に作り、tool 実行や DB 参照はその後にだけ行う
+2. **意味決定は prompt 側、binding は deterministic 側**
+   - prompt は request の意味、対象 user/time/scope、必要 evidence を JSON で決める
+   - code は schema / enum / placeholder / date flattening / latest semantics を検証し、`viewer-self -> viewer.userId` のような binding だけを行う
+3. **contract に合わない中間 JSON は repair する**
+   - 参照や task の contract が壊れていたら、そのまま実行せず bounded retry で `reference repair` に差し戻す
+   - repair 後も直らなければ、silent reinterpretation ではなく clarification / limitation に倒す
+4. **rendering も 1 本化しない**
+   - factual post query のようなケースは deterministic renderer を優先する
+   - compare / synthesis のような複雑ケースだけ、軽量 final rendering を許可する
+5. **verifier fail は前段へ戻す**
+   - `answer-overclaim` のような文面問題だけでなく
+   - `intent-mismatch` / `reference-mismatch` / `insufficient-evidence` では reasoning phase に戻して組み直す
+
+現行 artifact は少なくとも次を前提にする。
+
+- `IntentSpec`
+- `ReferenceSpec`
+- `ResearchPlan`
+- `FeasibilityDecision`
+- `EvidencePack`
+- `AnswerSpec`
+- `VerificationReport`
+- `RepairSpec`
+
+また、最近の prompt contract では次を強く固定している。
+
+1. first-person (`私`, `自分`, `僕`, `俺`) は `viewer-self`
+2. `semantic.users` や `referenceSpec` に `me`, `self`, `viewer`, `私` などの pseudo-user を残さない
+3. bare `最新N件` は `post-query + outputMode=latest + sortOrder=newest + latestScope=global`
+4. `私の最新N件` / `ymdの最新N件` は `latestScope=user`
+5. `ゼタちゃんも含めて最新N件` は `latestScope=global-with-includes`
+6. bare latest request に implicit date range を捏造しない
+
+以下の本文には初期 coordinator 案の記述も残るが、**現行の読み方としては「router だけで進める」のではなく、「reasoning barrier で task/reference/plan を確定してから executor に渡す」**ものとして読む。
+
+---
+
 ## 背景
 
 現行の `deepseek-chat.ts` は、tool safety と継続性を高める修正を積み上げており、破綻しにくさは上がっている。一方で、次の点が token 消費と実行品質の両面でボトルネックになっている。
@@ -566,7 +616,7 @@ phase は **ユーザーが暇にならない程度**に保ち、内部 loop の
 
 1. `public/chat-widget.js`
    - phase 名追加が必要なら最小限で追従
-2. `/tmp/zetter-chat-ui-test/tests/*.spec.js`
+2. browser-level regression tests
    - phase / final behavior の回帰確認
 
 ---
@@ -755,28 +805,28 @@ phase は **ユーザーが暇にならない程度**に保ち、内部 loop の
    - frontend を触った場合は必須
 2. `npm run typecheck`
 3. `npm run build:cloudrun`
-4. `/tmp/zetter-chat-ui-test` の relevant local tests
-   - `tests/local-final-progress.spec.js`
-   - `tests/local-live-status.spec.js`
+4. browser regression suite の relevant local tests
+   - final-progress 相当
+   - live-status 相当
 5. 追加した unit/integration test
 
 ### Step 3: Deploy
 
 #### 原則
 
-1. `public/**` を触ったら **Workers を deploy**
-2. `src/services/**` / `src/routes/**` / `src/schemas.ts` / `src/server.ts` を触ったら **Cloud Run を deploy**
-3. schema を増やしたら、本番 Cloud SQL(Postgres) に必要な table/index があることを確認する
+1. frontend delivery layer を触ったら、その配信対象を deploy
+2. backend service layer を触ったら、その実行対象を deploy
+3. schema を増やしたら、本番 DB に必要な table/index があることを確認する
 
 #### この仕様の default
 
-本仕様の実装では backend 変更が必須で、progress / phase / browser verification にも影響しやすいため、**特別な理由がなければ Workers と Cloud Run の両方を deploy 対象とする**。
+本仕様の実装では backend 変更が必須で、progress / phase / browser verification にも影響しやすいため、**特別な理由がなければ関連する frontend / backend の両方を deploy 対象とする**。
 
 #### Deploy 後の必須確認
 
-1. `https://z-etter.com/api/health` が 200
-2. 公開 asset hash が最新変更を指す
-3. Cloud Run latest ready revision が更新されている
+1. production health endpoint が正常応答する
+2. 公開 asset version/hash が最新変更を指す
+3. backend service の最新 revision/deployment が更新されている
 
 ---
 
@@ -786,7 +836,7 @@ deploy 後は、次の順で **本番確認**を行う。
 
 ### 1. Production browser test
 
-`/tmp/zetter-chat-ui-test/tests/prod-chat-progress.spec.js` を実行し、pass すること。
+production browser regression suite を実行し、pass すること。
 
 これが fail した場合、**実装完了ではない**。
 
@@ -865,7 +915,7 @@ guard / finalizer / ToolEnvelope を修正し、**本番画面で見えなくな
 
 #### production browser test が落ちた場合
 
-UI / progress / stream / phase 実装を修正し、**`tests/prod-chat-progress.spec.js` が pass するまで修正を続ける**。
+UI / progress / stream / phase 実装を修正し、**production browser regression suite が pass するまで修正を続ける**。
 
 #### route / call 数が DB で追えない場合
 
@@ -877,7 +927,7 @@ summary 記録実装と schema を修正し、**本番 request ごとに route, 
 
 次の文を機械的な完了判定とする。
 
-> Workers / Cloud Run / 必要な schema が deploy 済みであり、本番 `/chat` に対して雑談 request、direct-template request、Zetter summary request を実行した結果、`dev_chat_request_summaries` と `dev_chat_usage_records` で route / gate / tool_call_count / augment_rounds / finalizer_calls / template_used を確認でき、さらに production browser test が pass し、UI に raw JSON / DSML / pseudo tool syntax / 完了後 progress timeline / model-thinking switcher が表示されないことを確認できた場合、実装完了とする。
+> 関連する deploy target と必要な schema が deploy 済みであり、本番 `/chat` に対して雑談 request、direct-template request、Zetter summary request を実行した結果、request summary / usage records から route / gate / tool_call_count / augment_rounds / finalizer_calls / template_used を確認でき、さらに production browser test が pass し、UI に raw JSON / DSML / pseudo tool syntax / 完了後 progress timeline / model-thinking switcher が表示されないことを確認できた場合、実装完了とする。
 
 > 上記のいずれかを確認できない場合、または条件を満たさない場合、完了とはみなさず、条件を満たすまで実装の修正、deploy、再確認を続ける。
 

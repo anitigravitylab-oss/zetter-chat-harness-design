@@ -11,17 +11,17 @@
 ```
 [ユーザー入力]
       │
-      ├─ 画像添付あり ──→ [Gemini 画像解析] ──→ [直接回答]
-      │                                              ↑
-      ├─ 投稿検索 ON ──→ [プランナー]               │
-      │                       │                     │
-      │          kind=db      │  kind=no_db / needs_clarification
-      │               ↓       └─────────────────────┘
-      │       [DB エグゼキューター]
-      │               ↓
-      │       [DB 検索ファイナライザー]
+      ├─ 画像添付あり ──────────────────────────────────→ [Gemini 画像解析] ──→ [直接回答]
+      │                                                                               ↑
+      ├─ 投稿検索 ON ──→ [プランナー]                                                │
+      │                       │                                                      │
+      │                       ├─ kind=db ──→ [DB エグゼキューター]                  │
+      │                       │                      ↓                               │
+      │                       ├─ kind=needs_clarification ──→ [DB 検索ファイナライザー]
+      │                       │                                                      │
+      │                       └─ kind=no_db ──────────────────────────────────────→ ┘
       │
-      └─ 投稿検索 OFF ───────────────────────→ [直接回答]
+      └─ 投稿検索 OFF ────────────────────────────────────────────────────────────→ [直接回答]
 ```
 
 ユーザーが「投稿検索」チップを ON にしたときだけプランナーを起動する。
@@ -138,7 +138,8 @@ DB 実行結果をまとめた構造体。ファイナライザーにそのま�
 
 `streamDevChatMessage` 内（`db-chat-harness-v2.ts`）
 
-DB 結果がある場合（`material.status !== "no_db"`）の最終回答生成。
+`material.status !== "no_db"` の場合の最終回答生成。`ok` / `partial` / `error` / `needs_clarification` がここに入る。  
+`no_db`、および DB 取得自体が失敗した場合（`material === null`）は直接回答パスへ落ちる。
 
 ### モデルと設定
 
@@ -172,7 +173,7 @@ Recent conversation history (for context only):
 
 User's request: 「（ユーザーのメッセージ）」
 
-=== DATABASE RECORDS ===
+=== DATABASE RECORDS (read all, do not list to user) ===
 （buildDbMaterialText の出力）
 === END OF RECORDS ===
 
@@ -185,8 +186,10 @@ Now write your interpretation in natural Japanese.
 
 次の場合に使われる:
 - 投稿検索 OFF
-- 投稿検索 ON だが `no_db` / `needs_clarification` 判定
+- 投稿検索 ON だが `no_db` 判定（または DB 取得エラー）
 - 画像添付あり（`imageContext` もユーザーメッセージ先頭に付与）
+
+`needs_clarification` はここではなく DB 検索ファイナライザーを通る（`status !== "no_db"` のため）。
 
 ### モデルと設定
 

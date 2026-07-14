@@ -54,7 +54,7 @@
         │            TOOL-CALLING LOOP                │
         │   (deepseek-v4-flash)                       │
         │   tool budget: ≤10 turns OR ≤45s wall-clock │
-        │   (ZYN_TOOL_BUDGET_TURNS / _WALL_MS env)    │
+        │   (env-overridable)                         │
         │                                             │
         │   ┌───────────────────────────────────┐    │
         │   │ LLM call (tool_choice auto/none/   │    │
@@ -92,7 +92,7 @@ query_posts_v2 · summarize_timeline · analyze_user · lookup_user_profile · c
 
 ## tool-loop の仕組み / How the tool loop works
 
-**JA:** 単一モデルを `for` ループで回します（`db-chat-harness-v2.ts`）。上限は固定ターン数ではなく **ツール実行予算**（PR #151「正直な着地」）で管理されます: `TOOL_BUDGET_DEFAULT_MAX_TURNS = 10` ターン **または** `TOOL_BUDGET_DEFAULT_WALL_MS = 45_000`（45 秒）のいずれか早い方（`isToolBudgetExceeded` が OR 条件で判定）。それぞれ `ZYN_TOOL_BUDGET_TURNS` / `ZYN_TOOL_BUDGET_WALL_MS` 環境変数で上書き可能。履歴ウィンドウは変わらず 24 メッセージ（`LOOP_HISTORY_WINDOW = 24`）。各ターンの流れ:
+**JA:** 単一モデルを `for` ループで回します（`db-chat-harness-v2.ts`）。上限は固定ターン数ではなく **ツール実行予算**（PR #151「正直な着地」）で管理されます: `TOOL_BUDGET_DEFAULT_MAX_TURNS = 10` ターン **または** `TOOL_BUDGET_DEFAULT_WALL_MS = 45_000`（45 秒）のいずれか早い方（`isToolBudgetExceeded` が OR 条件で判定）。それぞれ環境変数で上書き可能。履歴ウィンドウは変わらず 24 メッセージ（`LOOP_HISTORY_WINDOW = 24`）。各ターンの流れ:
 
 1. LLM 呼び出し（`tool_choice` は `auto` / `none` / `required` を状況で切替）
 2. assistant メッセージを履歴に push
@@ -101,9 +101,9 @@ query_posts_v2 · summarize_timeline · analyze_user · lookup_user_profile · c
 
 `tool_calls` が無く `stop` で終わったとき（または DSML 解析でもツール呼び出しが見つからないとき）にループを抜け、そのターンの本文を `normalizeChatText` で整形したものが最終回答になります。
 
-**最終ターン契約 / Force-stop:** ツール予算（10 ターン or 45 秒）を超えたターンでは `isToolBudgetExceeded` が真になり、そのターンに限りツール定義を API リクエストから外して（`tools`/`tool_choice` キーごと省略）ツール呼び出しを物理的に不能化し、`TOOL_BUDGET_FINAL_TURN_SYSTEM_MESSAGE`（「ツール呼び出しはここまで（予算上限）。…」）を system メッセージとして注入して、必ず文章で着地させます。個別の DeepSeek 呼び出しには別途 `DEEPSEEK_COMPLETION_TIMEOUT_MS = 90_000`（90 秒）のタイムアウトがあります。
+**最終ターン契約 / Force-stop:** ツール予算（10 ターン or 45 秒）を超えたターンでは `isToolBudgetExceeded` が真になり、そのターンに限りツール定義を API リクエストから外して（`tools`/`tool_choice` キーごと省略）ツール呼び出しを物理的に不能化し、着地を促す固定の system メッセージ（`TOOL_BUDGET_FINAL_TURN_SYSTEM_MESSAGE`）を注入して、必ず文章で着地させます。個別の DeepSeek 呼び出しには別途 `DEEPSEEK_COMPLETION_TIMEOUT_MS = 90_000`（90 秒）のタイムアウトがあります。
 
-**EN:** A single model runs in a `for` loop (`db-chat-harness-v2.ts`). Instead of a fixed turn cap, the loop is governed by a **tool execution budget** (PR #151, "honest landing"): `TOOL_BUDGET_DEFAULT_MAX_TURNS = 10` turns **or** `TOOL_BUDGET_DEFAULT_WALL_MS = 45_000` (45s), whichever comes first (`isToolBudgetExceeded` checks both with OR), each overridable via `ZYN_TOOL_BUDGET_TURNS` / `ZYN_TOOL_BUDGET_WALL_MS`. The history window remains 24 messages (`LOOP_HISTORY_WINDOW = 24`). Each turn: LLM call (`tool_choice` switched between `auto` / `none` / `required`) → push assistant message → execute any `tool_calls` and push results as `role: tool` messages → repeat. The loop breaks when there are no `tool_calls` and the model stops (or DSML parsing finds no tool calls); the breaking turn's content, passed through `normalizeChatText`, is the final answer. **Final-turn contract / force-stop:** once the tool budget (10 turns or 45s) is exceeded, `isToolBudgetExceeded` fires and that turn is sent with no tool definitions at all (the `tools`/`tool_choice` keys are omitted from the API request) — physically disabling further tool calls — plus a `TOOL_BUDGET_FINAL_TURN_SYSTEM_MESSAGE` system message telling the model to wrap up in prose. Individual DeepSeek calls separately carry a `DEEPSEEK_COMPLETION_TIMEOUT_MS = 90_000` (90s) timeout.
+**EN:** A single model runs in a `for` loop (`db-chat-harness-v2.ts`). Instead of a fixed turn cap, the loop is governed by a **tool execution budget** (PR #151, "honest landing"): `TOOL_BUDGET_DEFAULT_MAX_TURNS = 10` turns **or** `TOOL_BUDGET_DEFAULT_WALL_MS = 45_000` (45s), whichever comes first (`isToolBudgetExceeded` checks both with OR), each overridable via environment variables. The history window remains 24 messages (`LOOP_HISTORY_WINDOW = 24`). Each turn: LLM call (`tool_choice` switched between `auto` / `none` / `required`) → push assistant message → execute any `tool_calls` and push results as `role: tool` messages → repeat. The loop breaks when there are no `tool_calls` and the model stops (or DSML parsing finds no tool calls); the breaking turn's content, passed through `normalizeChatText`, is the final answer. **Final-turn contract / force-stop:** once the tool budget (10 turns or 45s) is exceeded, `isToolBudgetExceeded` fires and that turn is sent with no tool definitions at all (the `tools`/`tool_choice` keys are omitted from the API request) — physically disabling further tool calls — plus a `TOOL_BUDGET_FINAL_TURN_SYSTEM_MESSAGE` system message telling the model to wrap up in prose. Individual DeepSeek calls separately carry a `DEEPSEEK_COMPLETION_TIMEOUT_MS = 90_000` (90s) timeout.
 
 ---
 
@@ -197,13 +197,13 @@ query_posts_v2 · summarize_timeline · analyze_user · lookup_user_profile · c
 
 - **L1（スレッド内 running summary）**: `L1_KEEP_WINDOW = 24`、`L1_OUTPUT_CHAR_LIMIT = 2,000`、`L1_INPUT_CHAR_LIMIT = 24,000` など。バックログ件数・文字数やツール結果のオーバーフロー（`L1_TOOL_OVERFLOW_TRIGGER_COUNT = 8` 件 / `L1_TOOL_OVERFLOW_TRIGGER_CHARS = 12,000` 文字、`L1_BACKLOG_TRIGGER_COUNT = 16` 件 / `L1_BACKLOG_TRIGGER_CHARS = 8,000` 文字）のいずれかが閾値を超えると `shouldRecomputeThreadMemory` が再合成をトリガーし、`buildL1MemoryBlock` が `<thread_memory>` フェンスで注入。システムプロンプト内では「# 10. Memory within this conversation」として、要約の有無で文言が動的に切替わります
 - **L2（ユーザー横断・日次ダイジェスト）**: `L2_MAX_USERS_PER_RUN = 50`、`L2_INPUT_CHAR_LIMIT = 20,000`、`L2_OUTPUT_CHAR_LIMIT_PER_FIELD = 1,200`、`L2_THREAD_DIGEST_MAX_CHARS = 1,000`。`buildL2MemoryBlock` が `<user_memory>` フェンスで facts/prefs を注入
-- チャット DB は本番 PostgreSQL（D1 ではない）。L1/L2 テーブルは初回チャット時に ensure 作成される
+- L1/L2 はチャット用 DB のテーブルとして保持され、初回チャット時に ensure 作成される
 
 **EN:** As of 2026-06-29 there was only the 24-message recent-history window; a two-tier memory layer has since been added on top (`db-chat-harness-v2.ts`). The recent-history window itself is unchanged (`LOOP_HISTORY_WINDOW = 24`). Injection order into the prompt is fixed: **L2 (cross-user) → L1 (thread summary) → raw recent tool results**.
 
 - **L1 (in-thread running summary)**: `L1_KEEP_WINDOW = 24`, `L1_OUTPUT_CHAR_LIMIT = 2,000`, `L1_INPUT_CHAR_LIMIT = 24,000`, among others. `shouldRecomputeThreadMemory` triggers recomputation when backlog count/chars or tool-result overflow (`L1_TOOL_OVERFLOW_TRIGGER_COUNT = 8` entries / `L1_TOOL_OVERFLOW_TRIGGER_CHARS = 12,000` chars, `L1_BACKLOG_TRIGGER_COUNT = 16` entries / `L1_BACKLOG_TRIGGER_CHARS = 8,000` chars) exceed thresholds; `buildL1MemoryBlock` injects it inside a `<thread_memory>` fence. In the system prompt this surfaces as "§10. Memory within this conversation", with wording that switches dynamically depending on whether a summary exists.
 - **L2 (cross-user daily digest)**: `L2_MAX_USERS_PER_RUN = 50`, `L2_INPUT_CHAR_LIMIT = 20,000`, `L2_OUTPUT_CHAR_LIMIT_PER_FIELD = 1,200`, `L2_THREAD_DIGEST_MAX_CHARS = 1,000`. `buildL2MemoryBlock` injects facts/prefs inside a `<user_memory>` fence.
-- The chat DB is production PostgreSQL (not D1). L1/L2 tables are created on first chat via an ensure step.
+- L1/L2 are persisted as tables in the chat database, created on first chat via an ensure step.
 
 ---
 
@@ -221,9 +221,9 @@ query_posts_v2 · summarize_timeline · analyze_user · lookup_user_profile · c
 
 ## observability（推論トレース） / Observability
 
-**JA:** `ZYN_TRACE_LOG="true"` のときのみ有効。`appendDevChatLlmOutput` を各ターンで呼び（`stage="turn-N"`: assistantText, reasoningContent, finishReason, toolCalls トレース）、最後に 1 回（`stage="final"`: turnCount, finalAnswer, 4 ブレーカーの真偽 — contradiction / postSuccessLie / missingTool / turn0RetryDone）記録します。保存先は `dev_chat_llm_outputs`。トークン使用量はターンごとに `appendDevChatUsageRecord` で別途記録します。
+**JA:** トレース用の環境変数フラグを有効にしたときのみ動作します。`appendDevChatLlmOutput` を各ターンで呼び（`stage="turn-N"`: assistantText, reasoningContent, finishReason, toolCalls トレース）、最後に 1 回（`stage="final"`: turnCount, finalAnswer, 4 ブレーカーの真偽 — contradiction / postSuccessLie / missingTool / turn0RetryDone）記録します。保存先は `dev_chat_llm_outputs`。トークン使用量はターンごとに `appendDevChatUsageRecord` で別途記録します。
 
-**EN:** Gated by `ZYN_TRACE_LOG="true"`. `appendDevChatLlmOutput` is called per turn (`stage="turn-N"`: assistantText, reasoningContent, finishReason, toolCalls trace) and once at the end (`stage="final"`: turnCount, finalAnswer, the four circuit-breaker booleans). Records go to `dev_chat_llm_outputs`. Per-turn token usage is recorded separately via `appendDevChatUsageRecord`.
+**EN:** Gated by an environment-variable trace flag. `appendDevChatLlmOutput` is called per turn (`stage="turn-N"`: assistantText, reasoningContent, finishReason, toolCalls trace) and once at the end (`stage="final"`: turnCount, finalAnswer, the four circuit-breaker booleans). Records go to `dev_chat_llm_outputs`. Per-turn token usage is recorded separately via `appendDevChatUsageRecord`.
 
 ---
 

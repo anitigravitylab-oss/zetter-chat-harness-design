@@ -13,32 +13,48 @@
 
 ## 今回の大きな変更 / What changed in this update
 
-**JA:** 旧設計は **コード主導の固定パイプライン**でした（intent 分類 LLM → コードが固定の DB ステップを組み立て → 最終文生成）。LLM は「意図分類」と「最終文の整形」しか担っておらず、ルーティングが硬直し、能力詐称（「アクセスできる範囲に限り…」等の嘘）が出やすいという問題がありました。
+**JA:** 本セクションは 2026-06-29（tool-loop v2 初期）以降の進化を反映した **2026-07-14 更新**です。基本アーキテクチャ（単一プロンプト + tool-calling ループ、`deepseek-v4-flash` 続投）は変わっていませんが、以下が積み上がりました:
 
-現行設計はこれを **単一プロンプト + tool-calling ループ**へ転換しました。単一モデル（`deepseek-v4-flash`）が 1 つの包括的なシステムプロンプトのもとで、毎ターン自分でツールを選び、結果を会話履歴に戻して継続し、最終回答を出します。ハーネスはルーティングを持たず、**足場（grounding / normalization / observability / safety net）**に徹します。
+- **ツールが 5→6 個**: `aggregate_posts`（groupBy: day/weekday/hour/month/author/kind の集計専用ツール）を追加。`query_posts_v2` にも `hourFrom`/`hourTo`（時間帯フィルタ）が追加
+- **「正直な着地」**（#151）: ターン数・履歴長ベースの素朴な上限から、**ツール実行予算**（既定 10 ターン or 45 秒）＋**最終ターン契約**（予算超過時は `tools: []` で物理的に呼び出し不能にし、必ず文章で着地させる）に置き換え
+- **本文捏造対策 / content grounding**（#132）: システムプロンプトに「records へのグラウンディング」節を新設し、`returned`/`fetched`/`totalMatched` の混同禁止・投稿時刻の verbatim 扱いなどを明文化
+- **メモリ基盤 v2**: スレッド内 running summary（L1）＋ユーザー横断日次ダイジェスト（L2）の 2 層を追加。24 メッセージの直近履歴ウィンドウ自体は維持
+- **能力の正典化・出典リンク**（#259）: 「Capability Charter」節と出典明示ルールをプロンプトに追加（2026-07-13 の本番デプロイに包含済み）
+- **画像添付の修正**（#197 / #199）: 直接添付の Gemini 応答 JSON 構造ゆれ対応、投稿添付画像も同じ Gemini 解析経路に統合
 
-**EN:** The old design was a **code-driven fixed pipeline** (intent-classifier LLM → code assembles fixed DB steps → finalizer generates prose). The LLM only did "intent classification" and "final-text formatting", which made routing rigid and made ability-denying hallucinations easy to emit.
+**EN:** This section is the **2026-07-14 update**, covering evolution since 2026-06-29 (early tool-loop v2). The core architecture (single prompt + tool-calling loop, `deepseek-v4-flash` retained) is unchanged, but the following accumulated on top:
 
-The current design replaces this with a **single prompt + tool-calling loop**. One model (`deepseek-v4-flash`), under a single comprehensive system prompt, selects tools itself each turn, feeds results back into the conversation, continues, and produces the final answer. The harness owns no routing logic; it acts purely as **scaffolding** (grounding / normalization / observability / safety nets).
+- **Tools 5→6**: added `aggregate_posts` (a dedicated aggregation tool with `groupBy`: day/weekday/hour/month/author/kind); `query_posts_v2` also gained `hourFrom`/`hourTo` (time-of-day filtering)
+- **"Honest landing"** (#151): replaced the naive turn/history-based cap with a **tool execution budget** (default 10 turns or 45s) plus a **final-turn contract** — once the budget is exceeded, the next turn is sent with `tools: []`, physically preventing further tool calls so the model always lands a prose answer
+- **Content grounding / anti-fabrication** (#132): a new "grounding to records" prompt section bans conflating `returned`/`fetched`/`totalMatched` and mandates verbatim post timestamps, among other rules
+- **Memory v2**: added a two-tier memory — an in-thread running summary (L1) and a cross-user daily digest (L2) — layered on top of the still-unchanged 24-message recent history window
+- **Capability canon + citation links** (#259): added a "Capability Charter" section and source-citation rules to the prompt (included in the 2026-07-13 production deployment)
+- **Image attachment fixes** (#197 / #199): fixed Gemini response JSON-shape drift silently dropping directly-attached images, and unified attached-post images onto the same Gemini analysis path
 
 ---
 
 ## アーキテクチャ全体像 / Architecture overview
 
 ```
-                 user message (+ optional images)
+                 user message (+ optional images / attached post)
                               │
         ┌─────────────────────▼─────────────────────┐
         │  Harness scaffolding (db-chat-harness-v2)   │
         │  • JST date grounding (injected per request)│
-        │  • Gemini image context (prepended)         │
+        │  • Gemini image context (direct + attached  │
+        │    post, both via buildGeminiImageContext)  │
         │  • thread context load                      │
+        │  • memory: L2 (cross-user digest) →         │
+        │            L1 (thread running summary) →    │
+        │            recent raw history (24 msgs)      │
         └─────────────────────┬─────────────────────┘
                               │  single comprehensive system prompt
                               │  + history window (24 msgs)
         ┌─────────────────────▼─────────────────────┐
         │            TOOL-CALLING LOOP                │
-        │   (deepseek-v4-flash, up to 5 turns)        │
+        │   (deepseek-v4-flash)                       │
+        │   tool budget: ≤10 turns OR ≤45s wall-clock │
+        │   (env-overridable)                         │
         │                                             │
         │   ┌───────────────────────────────────┐    │
         │   │ LLM call (tool_choice auto/none/   │    │
@@ -50,6 +66,11 @@ The current design replaces this with a **single prompt + tool-calling loop**. O
         │   execute tools       break → final answer  │
         │   push role:tool                            │
         │   results, repeat                           │
+        │                                             │
+        │   budget exceeded → final-turn contract:    │
+        │   tool defs omitted from the API request    │
+        │   + wrap-up system message forces a prose   │
+        │   landing (no more tool calls)              │
         └─────────────────────┬─────────────────────┘
                               │  final answer
         ┌─────────────────────▼─────────────────────┐
@@ -61,17 +82,17 @@ The current design replaces this with a **single prompt + tool-calling loop**. O
                   answer to user + persistence
 ```
 
-**5 fixed tools (registered unconditionally):**
+**6 fixed tools (registered unconditionally):**
 
 ```
-query_posts_v2 · summarize_timeline · analyze_user · lookup_user_profile · compare_users
+query_posts_v2 · summarize_timeline · analyze_user · lookup_user_profile · compare_users · aggregate_posts
 ```
 
 ---
 
 ## tool-loop の仕組み / How the tool loop works
 
-**JA:** 単一モデルを `for` ループで最大 `LOOP_MAX_TURNS_EXTENDED = 5` ターン回します（`db-chat-harness-v2.ts`）。履歴ウィンドウは 24 メッセージ。各ターンの流れ:
+**JA:** 単一モデルを `for` ループで回します（`db-chat-harness-v2.ts`）。上限は固定ターン数ではなく **ツール実行予算**（PR #151「正直な着地」）で管理されます: `TOOL_BUDGET_DEFAULT_MAX_TURNS = 10` ターン **または** `TOOL_BUDGET_DEFAULT_WALL_MS = 45_000`（45 秒）のいずれか早い方（`isToolBudgetExceeded` が OR 条件で判定）。それぞれ環境変数で上書き可能。履歴ウィンドウは変わらず 24 メッセージ（`LOOP_HISTORY_WINDOW = 24`）。各ターンの流れ:
 
 1. LLM 呼び出し（`tool_choice` は `auto` / `none` / `required` を状況で切替）
 2. assistant メッセージを履歴に push
@@ -80,48 +101,56 @@ query_posts_v2 · summarize_timeline · analyze_user · lookup_user_profile · c
 
 `tool_calls` が無く `stop` で終わったとき（または DSML 解析でもツール呼び出しが見つからないとき）にループを抜け、そのターンの本文を `normalizeChatText` で整形したものが最終回答になります。
 
-**強制停止 / Force-stop:** `turn >= LOOP_MAX_TURNS (3)` で `tool_choice="none"` に倒す（ただしツール結果が 2 件以上ありまだ要約が無い場合は延長）。`turn = 4` で hard force-stop。
+**最終ターン契約 / Force-stop:** ツール予算（10 ターン or 45 秒）を超えたターンでは `isToolBudgetExceeded` が真になり、そのターンに限りツール定義を API リクエストから外して（`tools`/`tool_choice` キーごと省略）ツール呼び出しを物理的に不能化し、着地を促す固定の system メッセージ（`TOOL_BUDGET_FINAL_TURN_SYSTEM_MESSAGE`）を注入して、必ず文章で着地させます。個別の DeepSeek 呼び出しには別途 `DEEPSEEK_COMPLETION_TIMEOUT_MS = 90_000`（90 秒）のタイムアウトがあります。
 
-**EN:** A single model runs in a `for` loop up to `LOOP_MAX_TURNS_EXTENDED = 5` turns. History window: 24 messages. Each turn: LLM call (`tool_choice` switched between `auto` / `none` / `required`) → push assistant message → execute any `tool_calls` and push results as `role: tool` messages → repeat. The loop breaks when there are no `tool_calls` and the model stops (or DSML parsing finds no tool calls); the breaking turn's content, passed through `normalizeChatText`, is the final answer. Force-stop flips `tool_choice` to `"none"` at `turn >= LOOP_MAX_TURNS (3)` (unless there are ≥2 tool results and no summary yet, which extends the loop), with a hard force-stop at `turn = 4`.
+**EN:** A single model runs in a `for` loop (`db-chat-harness-v2.ts`). Instead of a fixed turn cap, the loop is governed by a **tool execution budget** (PR #151, "honest landing"): `TOOL_BUDGET_DEFAULT_MAX_TURNS = 10` turns **or** `TOOL_BUDGET_DEFAULT_WALL_MS = 45_000` (45s), whichever comes first (`isToolBudgetExceeded` checks both with OR), each overridable via environment variables. The history window remains 24 messages (`LOOP_HISTORY_WINDOW = 24`). Each turn: LLM call (`tool_choice` switched between `auto` / `none` / `required`) → push assistant message → execute any `tool_calls` and push results as `role: tool` messages → repeat. The loop breaks when there are no `tool_calls` and the model stops (or DSML parsing finds no tool calls); the breaking turn's content, passed through `normalizeChatText`, is the final answer. **Final-turn contract / force-stop:** once the tool budget (10 turns or 45s) is exceeded, `isToolBudgetExceeded` fires and that turn is sent with no tool definitions at all (the `tools`/`tool_choice` keys are omitted from the API request) — physically disabling further tool calls — plus a `TOOL_BUDGET_FINAL_TURN_SYSTEM_MESSAGE` system message telling the model to wrap up in prose. Individual DeepSeek calls separately carry a `DEEPSEEK_COMPLETION_TIMEOUT_MS = 90_000` (90s) timeout.
 
 ---
 
-## 5 つの固定ツール / The five fixed tools
+## 6 つの固定ツール / The six fixed tools
+
+**JA:** `TOOL_CALL_LOOP_TOOL_DEFINITIONS`（`zetter-chat-tools.ts`）に定義。PR #147 で集計専用の `aggregate_posts` が追加され 5→6 個になり、PR #151 で `query_posts_v2` に時間帯フィルタ (`hourFrom`/`hourTo`) が加わりました。
+
+**EN:** Defined in `TOOL_CALL_LOOP_TOOL_DEFINITIONS` (`zetter-chat-tools.ts`). PR #147 added the aggregation-only `aggregate_posts` tool (5→6), and PR #151 added time-of-day filtering (`hourFrom`/`hourTo`) to `query_posts_v2`.
 
 | Tool | 用途 / Purpose | 主なパラメータ / Key params |
 |---|---|---|
-| `query_posts_v2` | 投稿の検索・取得。任意の日付範囲・キーワード・ユーザー・投稿 ID・ページング / Post search & retrieval over an arbitrary date range, keyword, user, post id, with pagination | `userId`, `keyword`, `postId`, `fromDate`, `toDate` (YYYY-MM-DD JST), `sortOrder`, `cursorSeq`, `beforeSeq`, `includeAiCast`, `limit` (max 80) — at least one filter required |
-| `summarize_timeline` | 固定ウィンドウのタイムライン概観（流れ・話題） / Recent timeline overview for a fixed window | `window` (`24h` \| `7d` \| `since-last-visit`), `limit` (max 30), `includeAiCast` |
-| `analyze_user` | 単一ユーザーの深掘り分析（人物像・話題・トーン） / Single-user deep analysis | `userId` (required), `aspect` (`personality` \| `topics` \| `tone`), `fromDate`, `toDate`, `postsToAnalyze` (max 80), `includeAiCast` |
+| `query_posts_v2` | 投稿の検索・取得。任意の日付範囲・時間帯・キーワード・ユーザー・投稿 ID・ページング / Post search & retrieval over an arbitrary date range, time-of-day range, keyword, user, post id, with pagination | `userId`, `keyword`, `postId`, `fromDate`, `toDate` (YYYY-MM-DD JST), `hourFrom`, `hourTo` (0–23, JST, inclusive, day-crossing allowed), `sortOrder` (`newest`/`oldest`), `cursorSeq`, `beforeSeq`, `includeAiCast`, `limit` (1–80, default 20) — at least one of `userId`/`keyword`/`postId`/`fromDate`+`toDate`/`hourFrom`+`hourTo` required |
+| `summarize_timeline` | 固定ウィンドウのタイムライン概観（流れ・話題） / Recent timeline overview for a fixed window | `window` (`24h` \| `7d` \| `since-last-visit`), `fromDate`/`toDate` (指定時は window より優先 / take precedence over window if given), `limit` (1–30, default 20), `includeAiCast` |
+| `analyze_user` | 単一ユーザーの深掘り分析（人物像・話題・トーン） / Single-user deep analysis | `userId` (required), `aspect` (`personality` \| `topics` \| `tone`), `fromDate`, `toDate`, `postsToAnalyze` (1–80, default 80), `includeAiCast` |
 | `lookup_user_profile` | 軽量プロフィール取得（表示名・bio・投稿数） / Lightweight profile lookup | `userId` (required) のみ / only |
 | `compare_users` | 2 ユーザーの比較・相性診断 / Two-user comparison & compatibility | `userIdA`, `userIdB` (both required), `aspect` (`topics` \| `tone` \| `compatibility`), `fromDate`, `toDate`, `includeAiCast` |
+| `aggregate_posts` | 投稿の集計（曜日別・時間帯別など件数系の質問に直答） / Post aggregation for count-style questions (by weekday, by hour, etc.) | `groupBy` (required: `day`\|`weekday`\|`hour`\|`month`\|`author`\|`kind`), `fromDate`, `toDate`, `userId`, `keyword`, `includeAiCast` |
 
-**JA:** ツールは **無条件で常時登録**されます。いつ・どれを使うかは LLM が判断します（旧設計のような「投稿検索チップを ON」というオプトインは不要）。
+**JA:** ツールは **無条件で常時登録**されます。いつ・どれを使うかは LLM が判断します（旧設計のような「投稿検索チップを ON」というオプトインは不要）。パラメータの妥当性は `validateToolArgs` がツール呼び出し前に強制します。
 
-**EN:** All tools are **registered unconditionally**; the LLM decides when and which to use (no opt-in "post-search chip" as in the old design).
+**EN:** All tools are **registered unconditionally**; the LLM decides when and which to use (no opt-in "post-search chip" as in the old design). Parameter validity is enforced by `validateToolArgs` before each tool call executes.
 
 ---
 
 ## 単一システムプロンプト / Single system prompt
 
-**JA:** 旧の最小（約 8 行）プロンプトに代えて、1 本の包括的な 16 セクション構成のプロンプトを使います。主な節:
+**JA:** 旧の最小（約 8 行）プロンプトに代えて、`buildLoopSystemPrompt`（`zyn-system-prompt.ts`）が組み立てる 1 本の包括的な **# 1〜# 15 + 番号なし 2 節**構成のプロンプトを使います。2026-06-29 時点の番号付き 11 節（# 1〜# 11）から、PR #132（# 12 grounding）・PR #149（# 13 いいね思想の正典化）・PR #259（# 14 能力正典・# 15 出典）で 4 節が新設され、現在の構成は以下の通りです:
 
 - **Identity/role preamble** — ZYN（ジン）。Zetter を理解した、温かみのある会話調のアシスタント。中立的なボットではない
 - **# 1. Language** — ユーザーが明確に他言語で書かない限り、常に日本語
 - **# 2. Current date (JST)** — リクエスト時に算出した `YYYY-MM-DD` を注入。相対日付はツールに渡す前に絶対日付へ変換させる
-- **# 3. Honesty Protocol** — (1) ツールを呼ぶ前に能力を否定しない (2) 空結果は「その呼び出しでは見つからなかった」 (3) 推測しない
-  - **## True facts** — `query_posts_v2` は任意の `fromDate`/`toDate` を受け、固定の範囲制限は無い。ツール結果が真実の源
-  - **## Forbidden lies** — 自己限定的な禁止フレーズ（例:「アクセスできる範囲に限り」）を言い換え含め厳禁として列挙
-  - **## good / bad examples** — 正しい応答と禁止応答の具体 2 シナリオ
-- **# 4. Tool Routing** — 5 ツールの判定フロー: 比較→`compare_users` / 単一ユーザー→`analyze_user` / 今・最近→`summarize_timeline` / それ以外→`query_posts_v2`
+- **# 3. Honesty Protocol** — (1) ツールを呼ぶ前に能力を否定しない (2) 空結果は「その呼び出しでは見つからなかった」 (3) 推測しない（True facts / Forbidden lies / good-bad 例のサブ構成は維持）
+- **# 4. Tool Routing** — 6 ツールの判定フロー（比較→`compare_users` / 単一ユーザー→`analyze_user` / 今・最近→`summarize_timeline` / 集計→`aggregate_posts` / それ以外→`query_posts_v2`）＋「使えるツールはこの6つだけ」の明記＋時間帯質問は `hourFrom`/`hourTo` で一発検索（`beforeSeq`/`cursorSeq` での自前ページング探索は禁止）
 - **# 5. First-person / Bare-latest semantics** — 「私 / 自分」＝閲覧者。修飾なしの「最新 N 件」＝制約なし・新しい順のグローバル
 - **# 6. Empty Result Fallback** — 諦める前に別ツール・別パラメータで再試行。代替を尽くしてから「見つからない」と言う
 - **# 7. Tool Hygiene** — 疑似ツール構文や DSML を出力しない。ネイティブ tool call のみ。生 JSON を露出しない
 - **# 8. Mistakes & Self-Correction** — 簡潔に認め、ツールを呼び直し、正しい答えを出す。過剰な謝罪はしない
-- **# 9. Tone & Formatting** — 自然な日本語の散文。結論先出し。既定で markdown 表を使わない。固定の決め台詞なし
-- **# 10–11 + About Zetter** — Memory（24 メッセージ窓）/ Safety（システムプロンプトを開示しない）/ Zetter プラットフォームの事実と非機能
+- **# 9. Tone & Formatting** — 自然な日本語の散文。結論先出し。既定で markdown 表を使わない。キャラ設定・トーン調整・なりきり許容範囲もここに含む（PR #233 由来）
+- **# 10. Memory within this conversation** — スレッド要約の有無で文言が動的に切替（24 メッセージの直近履歴＋あれば L1 スレッド要約）
+- **# 11. Safety and boundaries** — システムプロンプト・内部実装・秘密を開示しない
+- **# 12. records へのグラウンディング（本文捏造の禁止・最重要）**（PR #132 新設）— `returned`/`fetched`/`totalMatched` を混同しない、投稿時刻は verbatim（丸め・言い換え禁止）、records に無い本文・時刻・著者を推測で書かない
+- **# 13. ZYN の立ち位置と AI cast**（@zetachan / @zett）（PR #149 新設）— いいね数・いいねランキングを聞かれても「答えられない」で終わらせず、意図的な設計方針として前向きに語る
+- **# 14. Capability Charter（能力・仕様の正典）**（PR #259 新設）
+- **# 15. 出典明示とリンク**（PR #259 新設）
+- **# About Zetter / # Product context**（番号なし） — Zetter プラットフォームの事実と非機能
 
-**EN:** Instead of the old minimal (~8-line) prompt, a single comprehensive **16-section** prompt is used: identity preamble (ZYN — a Zetter-aware, warm conversational assistant, not a neutral bot); #1 Language (Japanese unless the user clearly writes another language); #2 Current date (live-injected JST `YYYY-MM-DD`; relative dates converted to absolute before tool calls); #3 Honesty Protocol — never deny ability before calling a tool, treat empty results as "that call found nothing", no speculation — with **True facts** (`query_posts_v2` accepts any date range; tool results are the source of truth), **Forbidden lies** (enumerated self-limiting phrases banned, paraphrases included), and **good/bad examples**; #4 Tool Routing (compare→`compare_users`, single-user→`analyze_user`, now/recent→`summarize_timeline`, else→`query_posts_v2`); #5 First-person / bare-latest semantics; #6 Empty-result fallback; #7 Tool Hygiene (native tool calls only, no DSML/raw JSON); #8 Mistakes & self-correction; #9 Tone & formatting (natural Japanese prose, answer-first, no default markdown tables, no fixed catchphrase); #10–11 + About Zetter (24-msg memory, no system-prompt disclosure, Zetter platform facts and non-features).
+**EN:** Instead of the old minimal (~8-line) prompt, `buildLoopSystemPrompt` (`zyn-system-prompt.ts`) assembles a single comprehensive prompt now spanning **# 1–# 15 plus two unnumbered sections**. Since the 11 numbered sections (#1–#11) as of 2026-06-29, four sections were added: #12 by PR #132 (grounding), #13 by PR #149 (likes-philosophy canon), and #14/#15 by PR #259 (capability canon / citations). Current structure: identity preamble (ZYN — Zetter-aware, warm conversational assistant, not a neutral bot); #1 Language; #2 Current date (live-injected JST `YYYY-MM-DD`, relative dates converted to absolute before tool calls); #3 Honesty Protocol (never deny ability before calling a tool; empty results are "that call found nothing"; no speculation — the True-facts / Forbidden-lies / good-bad-example sub-structure is retained); #4 Tool Routing (compare→`compare_users`, single-user→`analyze_user`, now/recent→`summarize_timeline`, aggregation→`aggregate_posts`, else→`query_posts_v2`; states "only these 6 tools exist"; time-of-day questions must use `hourFrom`/`hourTo` in one call rather than manual `beforeSeq`/`cursorSeq` paging); #5 First-person / bare-latest semantics; #6 Empty-result fallback; #7 Tool Hygiene (native tool calls only, no DSML/raw JSON); #8 Mistakes & self-correction; #9 Tone & Formatting (natural Japanese prose, answer-first, no default markdown tables, now also covers character config/tone-shift/roleplay bounds per PR #233); #10 Memory within this conversation (dynamically worded depending on whether a thread summary exists; 24-message recent window + L1 summary if present); #11 Safety and boundaries (no system-prompt/internals/secrets disclosure); #12 Grounding to records (PR #132 — never conflate `returned`/`fetched`/`totalMatched`, keep post timestamps verbatim, never invent body/time/author beyond records); #13 ZYN's stance and AI cast (@zetachan / @zett) — never dead-end on like-count questions, frame it as a deliberate design choice; #14 Capability Charter (PR #259); #15 Source citation and links (PR #259); unnumbered # About Zetter / # Product context sections with platform facts and non-features.
 
 ---
 
@@ -142,9 +171,39 @@ query_posts_v2 · summarize_timeline · analyze_user · lookup_user_profile · c
 
 ## grounding（日付・能力） / Grounding
 
-**JA:** JST の現在日付を `Intl.DateTimeFormat`（`Asia/Tokyo`）でリクエスト時に算出し、毎回システムプロンプトへ注入します。プロンプトの True facts 節で「`query_posts_v2` の `fromDate`/`toDate` に固定の範囲制限は無い」「ツール結果が真実の源」と明示し、相対日付表現はツールに渡す前に今日の JST 日付を使って絶対 `YYYY-MM-DD` に変換させます。
+**JA:** JST の現在日付を `Intl.DateTimeFormat`（`Asia/Tokyo`）でリクエスト時に算出し、毎回システムプロンプトへ注入します（# 2 節）。プロンプトの True facts 節で「`query_posts_v2` の `fromDate`/`toDate` に固定の範囲制限は無い」「ツール結果が真実の源」と明示し、相対日付表現はツールに渡す前に今日の JST 日付を使って絶対 `YYYY-MM-DD` に変換させます。時間帯を問う質問は `hourFrom`/`hourTo`（0–23, JST）で一度に絞り込ませ、`beforeSeq`/`cursorSeq` を使った自前ページング探索は # 4 節で明示的に禁止しています。
 
-**EN:** The current JST date is computed per request via `Intl.DateTimeFormat` (`Asia/Tokyo`) and injected into the system prompt every time. The True-facts section states that `query_posts_v2`'s `fromDate`/`toDate` has no fixed range limit and that tool results are the source of truth; the model is instructed to convert all relative date expressions to absolute `YYYY-MM-DD` using today's JST date before passing them to tools.
+**EN:** The current JST date is computed per request via `Intl.DateTimeFormat` (`Asia/Tokyo`) and injected into the system prompt every time (§2). The True-facts section states that `query_posts_v2`'s `fromDate`/`toDate` has no fixed range limit and that tool results are the source of truth; the model is instructed to convert all relative date expressions to absolute `YYYY-MM-DD` using today's JST date before passing them to tools. Time-of-day questions must be resolved in one call via `hourFrom`/`hourTo` (0–23, JST); §4 explicitly forbids manual paging (`beforeSeq`/`cursorSeq`) as a substitute.
+
+---
+
+## 本文グラウンディング（records 捏造対策） / Content grounding (anti-fabrication)
+
+**JA:** PR #132（2026-07-01 マージ）で新設された、システムプロンプト **# 12** 節。ツール結果に無い本文・時刻・著者・出来事を推測で書くのを防ぐための規範です。要点:
+
+- `records[]` に入っている投稿だけが実際に読んだ本文。それ以外を推測で書かない
+- `records` は代表サンプルであり全件ではない。`totalMatched`（総数）が `returned`（表示件数）より多いときは「○件中△件を見た範囲では」と前置きする
+- 件数・種別の集計には `totalMatched` / `kindCountsAll`（全件・正確な値）を使い、個別エピソードは `records` 内のものだけを挙げる
+- `returned`（読めた件数）/ `fetched`（DB 取得件数）/ `totalMatched`（DB 総数）の 3 値を混同しない
+- 投稿時刻（`dateTimeJst` / `timeJst`）は verbatim（そのまま）で扱い、丸めたり言い換えたりしない
+
+**EN:** Introduced as system-prompt **§12** by PR #132 (merged 2026-07-01). A set of norms preventing the model from inventing post bodies, timestamps, authors, or events not present in tool results. Key points: only posts inside `records[]` are content the model actually read; `records` is a representative sample, not the full result set, so when `totalMatched` (total count) exceeds `returned` (shown count) the model must preface with "of N matching, based on the M I saw..."; count/category aggregates must use `totalMatched` / `kindCountsAll` (exact, full-set figures), while individual anecdotes may only cite items inside `records`; the three meta values `returned` (readable count) / `fetched` (DB-retrieved count) / `totalMatched` (DB total count) must never be conflated; post timestamps (`dateTimeJst` / `timeJst`) must be handled verbatim, never rounded or paraphrased.
+
+---
+
+## メモリ基盤 v2（L1/L2） / Memory v2 (L1/L2)
+
+**JA:** 2026-06-29 時点では 24 メッセージの直近履歴窓のみでしたが、その上に 2 層のメモリを追加しました（`db-chat-harness-v2.ts`）。直近履歴窓の 24 メッセージ自体は変わらず維持されます（`LOOP_HISTORY_WINDOW = 24`）。プロンプトへの注入順は **L2（ユーザー横断）→ L1（スレッド要約）→ 直近ツール結果の生データ** の固定順です。
+
+- **L1（スレッド内 running summary）**: `L1_KEEP_WINDOW = 24`、`L1_OUTPUT_CHAR_LIMIT = 2,000`、`L1_INPUT_CHAR_LIMIT = 24,000` など。バックログ件数・文字数やツール結果のオーバーフロー（`L1_TOOL_OVERFLOW_TRIGGER_COUNT = 8` 件 / `L1_TOOL_OVERFLOW_TRIGGER_CHARS = 12,000` 文字、`L1_BACKLOG_TRIGGER_COUNT = 16` 件 / `L1_BACKLOG_TRIGGER_CHARS = 8,000` 文字）のいずれかが閾値を超えると `shouldRecomputeThreadMemory` が再合成をトリガーし、`buildL1MemoryBlock` が `<thread_memory>` フェンスで注入。システムプロンプト内では「# 10. Memory within this conversation」として、要約の有無で文言が動的に切替わります
+- **L2（ユーザー横断・日次ダイジェスト）**: `L2_MAX_USERS_PER_RUN = 50`、`L2_INPUT_CHAR_LIMIT = 20,000`、`L2_OUTPUT_CHAR_LIMIT_PER_FIELD = 1,200`、`L2_THREAD_DIGEST_MAX_CHARS = 1,000`。`buildL2MemoryBlock` が `<user_memory>` フェンスで facts/prefs を注入
+- L1/L2 はチャット用 DB のテーブルとして保持され、初回チャット時に ensure 作成される
+
+**EN:** As of 2026-06-29 there was only the 24-message recent-history window; a two-tier memory layer has since been added on top (`db-chat-harness-v2.ts`). The recent-history window itself is unchanged (`LOOP_HISTORY_WINDOW = 24`). Injection order into the prompt is fixed: **L2 (cross-user) → L1 (thread summary) → raw recent tool results**.
+
+- **L1 (in-thread running summary)**: `L1_KEEP_WINDOW = 24`, `L1_OUTPUT_CHAR_LIMIT = 2,000`, `L1_INPUT_CHAR_LIMIT = 24,000`, among others. `shouldRecomputeThreadMemory` triggers recomputation when backlog count/chars or tool-result overflow (`L1_TOOL_OVERFLOW_TRIGGER_COUNT = 8` entries / `L1_TOOL_OVERFLOW_TRIGGER_CHARS = 12,000` chars, `L1_BACKLOG_TRIGGER_COUNT = 16` entries / `L1_BACKLOG_TRIGGER_CHARS = 8,000` chars) exceed thresholds; `buildL1MemoryBlock` injects it inside a `<thread_memory>` fence. In the system prompt this surfaces as "§10. Memory within this conversation", with wording that switches dynamically depending on whether a summary exists.
+- **L2 (cross-user daily digest)**: `L2_MAX_USERS_PER_RUN = 50`, `L2_INPUT_CHAR_LIMIT = 20,000`, `L2_OUTPUT_CHAR_LIMIT_PER_FIELD = 1,200`, `L2_THREAD_DIGEST_MAX_CHARS = 1,000`. `buildL2MemoryBlock` injects facts/prefs inside a `<user_memory>` fence.
+- L1/L2 are persisted as tables in the chat database, created on first chat via an ensure step.
 
 ---
 
@@ -162,9 +221,9 @@ query_posts_v2 · summarize_timeline · analyze_user · lookup_user_profile · c
 
 ## observability（推論トレース） / Observability
 
-**JA:** `ZYN_TRACE_LOG="true"` のときのみ有効。`appendDevChatLlmOutput` を各ターンで呼び（`stage="turn-N"`: assistantText, reasoningContent, finishReason, toolCalls トレース）、最後に 1 回（`stage="final"`: turnCount, finalAnswer, 4 ブレーカーの真偽 — contradiction / postSuccessLie / missingTool / turn0RetryDone）記録します。保存先は `dev_chat_llm_outputs`。トークン使用量はターンごとに `appendDevChatUsageRecord` で別途記録します。
+**JA:** トレース用の環境変数フラグを有効にしたときのみ動作します。`appendDevChatLlmOutput` を各ターンで呼び（`stage="turn-N"`: assistantText, reasoningContent, finishReason, toolCalls トレース）、最後に 1 回（`stage="final"`: turnCount, finalAnswer, 4 ブレーカーの真偽 — contradiction / postSuccessLie / missingTool / turn0RetryDone）記録します。保存先は `dev_chat_llm_outputs`。トークン使用量はターンごとに `appendDevChatUsageRecord` で別途記録します。
 
-**EN:** Gated by `ZYN_TRACE_LOG="true"`. `appendDevChatLlmOutput` is called per turn (`stage="turn-N"`: assistantText, reasoningContent, finishReason, toolCalls trace) and once at the end (`stage="final"`: turnCount, finalAnswer, the four circuit-breaker booleans). Records go to `dev_chat_llm_outputs`. Per-turn token usage is recorded separately via `appendDevChatUsageRecord`.
+**EN:** Gated by an environment-variable trace flag. `appendDevChatLlmOutput` is called per turn (`stage="turn-N"`: assistantText, reasoningContent, finishReason, toolCalls trace) and once at the end (`stage="final"`: turnCount, finalAnswer, the four circuit-breaker booleans). Records go to `dev_chat_llm_outputs`. Per-turn token usage is recorded separately via `appendDevChatUsageRecord`.
 
 ---
 
@@ -172,7 +231,7 @@ query_posts_v2 · summarize_timeline · analyze_user · lookup_user_profile · c
 
 | 機能 / Capability | 内容 / Detail |
 |---|---|
-| 画像解析 / Image analysis | Gemini。`imageDataUrls` → `buildGeminiImageContext`、結果をユーザーターンに前置（旧ハーネスと同一経路）/ result prepended to the user turn, identical path to the old harness |
+| 画像解析 / Image analysis | Gemini。直接添付（`imageDataUrls` → `buildGeminiImageContext`）と投稿添付（`attachedPostId` → `post_media_items` から取得 → 同じ `buildGeminiImageContext`、最大 4 枚、JPEG/PNG/WebP 限定）の 2 経路が同じ Gemini 解析関数に合流。注入位置は経路で異なり、直接添付は解析結果をユーザーターンに前置、投稿添付は直近ツール結果チャネル（`buildRecentToolContextBlock`）経由で注入。PR #197 で直接添付の Gemini 応答 JSON 構造ゆれによる無言失敗を修正、PR #199 で投稿添付画像も同経路に統合 / Two paths — direct attachment (`imageDataUrls` → `buildGeminiImageContext`) and attached-post images (`attachedPostId` → fetched from `post_media_items`, max 4, JPEG/PNG/WebP only) — converge on the same Gemini analysis function, but inject differently: direct-attachment results are prepended to the user turn, while attached-post results flow in via the recent-tool-results channel (`buildRecentToolContextBlock`). PR #197 fixed a silent failure from Gemini response JSON-shape drift on direct attachments; PR #199 unified attached-post images onto the same analysis path |
 | スレッド文脈 / Thread context | `loadThreadContext` + `maybeCompressAndSaveThreadContext` を引き続き実行 / still run |
 | レート制限 / Rate limiting | ループ後に `settleDevChatRateLimitReservation` を強制 / enforced after the loop |
 | 再処理 / Reprocess | `reprocessMessageId` 経路を保持（`buildAssistantOnlyFinalState`）/ preserved |
@@ -187,12 +246,12 @@ query_posts_v2 · summarize_timeline · analyze_user · lookup_user_profile · c
 | **制御主体 / Control principal** | Code-driven: `classifyIntentViaLlm` の JSON → `buildIntentRoute` がコードで固定 DB ステップを組み立て | LLM-driven: モデルが毎ターン `tool_choice='auto'` で自律的にツール選択。コード側のステップ写像なし |
 | **意図分類 / Intent classification** | 必須: DB アクセス前に planner LLM が `{kind, intent, userId, date, ...}` JSON を生成 | 廃止: LLM がユーザー文と文脈から、呼ぶか・どれを呼ぶかを直接決定 |
 | **DB アクセス起動 / DB activation** | Opt-in: ユーザーが「投稿検索」チップを ON にする必要（`tools` に `db-search`） | 常時利用可: ツールを無条件登録。取得タイミングは LLM が判断 |
-| **1 リクエストの LLM 呼数 / LLM calls** | 最低 2+（planner 1 + finalizer 1、＋任意の人物解決） | 1〜5 回（単一モデルのループ。通常 `LOOP_MAX_TURNS=3`、最大 5） |
+| **1 リクエストの LLM 呼数 / LLM calls** | 最低 2+（planner 1 + finalizer 1、＋任意の人物解決） | 単一モデルのループ。ツール実行予算（10 ターン or 45 秒、いずれか早い方）に達するまで継続し、超過ターンはツール定義を外した最終ターン契約で必ず着地 |
 | **根拠注入 / Evidence injection** | `DbRetrievalMaterial` を `=== DATABASE RECORDS ===` テキストブロックとしてユーザー文に埋込 | ツール結果を `role:tool` メッセージとして会話ターン履歴に差し込む |
-| **システムプロンプト範囲 / Prompt scope** | 最小の約 8 行の identity + ルール。プラットフォーム情報や DB 素材は別途ユーザー文へ注入 | 単一の包括的 16 セクション（日付・Honesty Protocol・ルーティング・Zetter 事実・安全を一本化） |
-| **能力詐称ガード / Ability-claiming guard** | 専用なし。planner が黙って `no_db` 分類し取得をスキップし得た | Honesty Protocol + 4 サーキットブレーカー（CB #11 / H2 / #12 / H3）で注記・強制再試行 |
+| **システムプロンプト範囲 / Prompt scope** | 最小の約 8 行の identity + ルール。プラットフォーム情報や DB 素材は別途ユーザー文へ注入 | 単一の包括的 # 1〜# 15 + 番号なし 2 節（日付・Honesty Protocol・ルーティング・本文グラウンディング・能力正典・出典・Zetter 事実・安全を一本化） |
+| **能力詐称ガード / Ability-claiming guard** | 専用なし。planner が黙って `no_db` 分類し取得をスキップし得た | Honesty Protocol + 4 サーキットブレーカー（CB #11 / H2 / #12 / H3）で注記・強制再試行。加えて能力正典（Capability Charter, PR #259）をプロンプトに明文化 |
 | **DSML テキスト tool call / DSML handling** | 該当なし（構造化 JSON 素材でテキスト tool call のリスクなし） | `parseDsmlToolCalls` が DSML テキストをネイティブ tool call に合成しループ継続 |
-| **ターン / ステップ上限 / Turn limit** | `MAX_STEPS=3` の固定コード反復（`executeRetrievalSteps`）。完了後 LLM 再入なし | `LOOP_MAX_TURNS=3`（soft）+ `LOOP_MAX_TURNS_EXTENDED=5`（hard）。結果件数で短縮 / 延長 |
+| **ターン / ステップ上限 / Turn limit** | `MAX_STEPS=3` の固定コード反復（`executeRetrievalSteps`）。完了後 LLM 再入なし | ツール実行予算: `TOOL_BUDGET_DEFAULT_MAX_TURNS=10` ターン **or** `TOOL_BUDGET_DEFAULT_WALL_MS=45,000`（45秒）、いずれか早い方（PR #151）。超過後はツール定義を外した最終ターン契約で強制着地 |
 | **人物解決 / Person resolution** | 2 段の固定コード: `search_users` → 条件付き後続の投稿/分析ステップ | LLM が解決戦略を決定。`lookup_user_profile` / `analyze_user` を独立ツールとして利用 |
 
 ### なぜ変えたか / Why we changed it
